@@ -48,25 +48,22 @@ def train_baseline(train_csv: str, n_splits: int = 10) -> dict:
     df = pd.read_csv(train_csv)
     df = prepare_features(df)
 
-    # Debug: check features look sensible
     print("Feature sample:")
     print(df[FEATURES].head(3).to_string())
     print(f"\nFVC range: {df['FVC'].min():.0f} – {df['FVC'].max():.0f} ml")
     print(f"Weeks range: {df['Weeks'].min()} – {df['Weeks'].max()}")
     print(f"Patients: {df['Patient'].nunique()}\n")
 
-    X   = df[FEATURES].values.astype(np.float64)
-    y   = df["FVC"].values.astype(np.float64)
+    X      = df[FEATURES].values.astype(np.float64)
+    y      = df["FVC"].values.astype(np.float64)
     groups = df["Patient"].values
 
-    # Scale features — critical for QuantileRegressor convergence
+    # DO NOT scale y — quantile regressor needs raw FVC scale
+    # Scale X only
     scaler = StandardScaler()
     X = scaler.fit_transform(X)
 
-    # GroupKFold — ensures no patient appears in both train and val
-    # This is correct for this dataset (patient-level split)
-    gkf = GroupKFold(n_splits=n_splits)
-
+    gkf       = GroupKFold(n_splits=n_splits)
     oof_mu    = np.zeros(len(df))
     oof_sigma = np.zeros(len(df))
 
@@ -74,9 +71,10 @@ def train_baseline(train_csv: str, n_splits: int = 10) -> dict:
         X_tr, X_val = X[tr_idx], X[val_idx]
         y_tr        = y[tr_idx]
 
-        q50 = QuantileRegressor(quantile=0.50, alpha=0.001, solver="highs")
-        q25 = QuantileRegressor(quantile=0.25, alpha=0.001, solver="highs")
-        q75 = QuantileRegressor(quantile=0.75, alpha=0.001, solver="highs")
+        # alpha=0 means no regularization — let the quantiles spread freely
+        q50 = QuantileRegressor(quantile=0.50, alpha=0.0, solver="highs")
+        q25 = QuantileRegressor(quantile=0.25, alpha=0.0, solver="highs")
+        q75 = QuantileRegressor(quantile=0.75, alpha=0.0, solver="highs")
 
         q50.fit(X_tr, y_tr)
         q25.fit(X_tr, y_tr)
@@ -84,8 +82,19 @@ def train_baseline(train_csv: str, n_splits: int = 10) -> dict:
 
         oof_mu[val_idx] = q50.predict(X_val)
 
-        iqr = q75.predict(X_val) - q25.predict(X_val)
-        oof_sigma[val_idx] = np.clip(iqr / 1.35, a_min=70, a_max=None)
+        q25_pred = q25.predict(X_val)
+        q75_pred = q75.predict(X_val)
+
+        # Debug first fold to confirm spread
+        if fold == 0:
+            print(f"  Q25 range: {q25_pred.min():.0f}–{q25_pred.max():.0f}")
+            print(f"  Q75 range: {q75_pred.min():.0f}–{q75_pred.max():.0f}")
+            print(f"  IQR mean : {(q75_pred - q25_pred).mean():.1f}")
+
+        oof_sigma[val_idx] = np.clip(
+            (q75_pred - q25_pred) / 1.35,
+            a_min=70, a_max=None
+        )
 
         fold_score = laplace_metric(
             oof_mu[val_idx], oof_sigma[val_idx], y[val_idx]
@@ -96,7 +105,6 @@ def train_baseline(train_csv: str, n_splits: int = 10) -> dict:
 
     overall = laplace_metric(oof_mu, oof_sigma, y)
     print(f"\nOverall OOF Laplace score : {overall:.4f}")
-    print(f"Score spread across folds : {np.std([laplace_metric(oof_mu[val_idx], oof_sigma[val_idx], y[val_idx]) for _, val_idx in gkf.split(X, y, groups)]):.4f}")
 
     return {
         "oof_mu":    oof_mu,
@@ -104,7 +112,6 @@ def train_baseline(train_csv: str, n_splits: int = 10) -> dict:
         "score":     overall,
         "scaler":    scaler
     }
-
 
 if __name__ == "__main__":
     train_baseline("data/raw/train.csv")
