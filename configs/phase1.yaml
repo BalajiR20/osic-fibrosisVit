@@ -1,0 +1,49 @@
+# Phase 1 configuration
+seed: 42
+n_folds: 10
+
+data:
+  raw_dir: "data/raw"
+  dicom_dir: "data/dicom"
+  processed_dir: "data/processed"
+
+tabular:
+  features:
+    - "Weeks"
+    - "WeekOffset"
+    - "Age"
+    - "Sex"
+    - "SmokingStatus"
+    - "FVC"
+  target: "FVC"
+  solver: "highs"
+  alpha: 0.01
+
+loss:
+  sigma_min: 70.0
+  delta_max: 1000.0
+```
+
+---
+
+## Fix 4 — Create requirements.txt
+
+In your project root, create `requirements.txt`:
+```
+torch
+torchvision
+monai
+pydicom
+SimpleITK
+pandas
+numpy
+scikit-learn
+matplotlib
+seaborn
+jupyter
+ipykernel
+pytorch-lightning
+wandb
+timm
+tqdm
+pyyaml
