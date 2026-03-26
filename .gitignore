@@ -1,0 +1,23 @@
+# Create .gitignore in your project root
+```
+
+Open VS Code, create a new file called `.gitignore` in the project root and paste this:
+```
+# Data — never push to GitHub (too large)
+data/dicom/
+data/processed/
+data/raw/*.zip
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+
+# Outputs
+outputs/*.pth
+outputs/*.ckpt
+
+# Env
+.env
+wandb/
