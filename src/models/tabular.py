@@ -1,38 +1,30 @@
 import numpy as np
 import pandas as pd
-from sklearn.linear_model import QuantileRegressor
-from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.preprocessing import LabelEncoder
 from sklearn.model_selection import GroupKFold
+import lightgbm as lgb
 from src.training.loss import laplace_metric
 
 
 def prepare_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
-    # Encode categoricals with fixed mapping (not fit_transform — that can vary per fold)
-    df["Sex_enc"]    = (df["Sex"] == "Male").astype(float)
+    df["Sex_enc"]     = (df["Sex"] == "Male").astype(float)
     df["Smoking_enc"] = df["SmokingStatus"].map({
-        "Never smoked": 0.0,
-        "Ex-smoker":    1.0,
-        "Currently smokes": 2.0
+        "Never smoked":      0.0,
+        "Ex-smoker":         1.0,
+        "Currently smokes":  2.0
     }).fillna(0.0)
 
-    # Week offset from each patient's first measurement
-    df["WeekOffset"] = df.groupby("Patient")["Weeks"].transform(
+    df["WeekOffset"]  = df.groupby("Patient")["Weeks"].transform(
         lambda x: x - x.min()
     )
-
-    # Baseline FVC (first measurement per patient)
-    baseline = df.groupby("Patient")["FVC"].transform("first")
-    df["BaselineFVC"] = baseline
-
-    # Weeks since baseline CT (negative weeks exist in this dataset)
+    df["BaselineFVC"] = df.groupby("Patient")["FVC"].transform("first")
     df["WeeksFromBase"] = df["Weeks"]
 
     return df
 
 
-# No Percent feature — 1st place winner found it hurts
 FEATURES = [
     "WeeksFromBase",
     "WeekOffset",
@@ -43,6 +35,18 @@ FEATURES = [
     "FVC"
 ]
 
+LGB_PARAMS_BASE = dict(
+    objective      = "quantile",
+    n_estimators   = 500,
+    learning_rate  = 0.05,
+    num_leaves     = 31,
+    min_child_samples = 10,
+    subsample      = 0.8,
+    colsample_bytree = 0.8,
+    random_state   = 42,
+    verbose        = -1,
+)
+
 
 def train_baseline(train_csv: str, n_splits: int = 10) -> dict:
     df = pd.read_csv(train_csv)
@@ -50,18 +54,12 @@ def train_baseline(train_csv: str, n_splits: int = 10) -> dict:
 
     print("Feature sample:")
     print(df[FEATURES].head(3).to_string())
-    print(f"\nFVC range: {df['FVC'].min():.0f} – {df['FVC'].max():.0f} ml")
-    print(f"Weeks range: {df['Weeks'].min()} – {df['Weeks'].max()}")
-    print(f"Patients: {df['Patient'].nunique()}\n")
+    print(f"\nFVC range : {df['FVC'].min():.0f} – {df['FVC'].max():.0f} ml")
+    print(f"Patients  : {df['Patient'].nunique()}\n")
 
     X      = df[FEATURES].values.astype(np.float64)
     y      = df["FVC"].values.astype(np.float64)
     groups = df["Patient"].values
-
-    # DO NOT scale y — quantile regressor needs raw FVC scale
-    # Scale X only
-    scaler = StandardScaler()
-    X = scaler.fit_transform(X)
 
     gkf       = GroupKFold(n_splits=n_splits)
     oof_mu    = np.zeros(len(df))
@@ -71,47 +69,39 @@ def train_baseline(train_csv: str, n_splits: int = 10) -> dict:
         X_tr, X_val = X[tr_idx], X[val_idx]
         y_tr        = y[tr_idx]
 
-        # alpha=0 means no regularization — let the quantiles spread freely
-        q50 = QuantileRegressor(quantile=0.50, alpha=0.0, solver="highs")
-        q25 = QuantileRegressor(quantile=0.25, alpha=0.0, solver="highs")
-        q75 = QuantileRegressor(quantile=0.75, alpha=0.0, solver="highs")
+        m50 = lgb.LGBMRegressor(**{**LGB_PARAMS_BASE, "alpha": 0.50})
+        m25 = lgb.LGBMRegressor(**{**LGB_PARAMS_BASE, "alpha": 0.25})
+        m75 = lgb.LGBMRegressor(**{**LGB_PARAMS_BASE, "alpha": 0.75})
 
-        q50.fit(X_tr, y_tr)
-        q25.fit(X_tr, y_tr)
-        q75.fit(X_tr, y_tr)
+        m50.fit(X_tr, y_tr)
+        m25.fit(X_tr, y_tr)
+        m75.fit(X_tr, y_tr)
 
-        oof_mu[val_idx] = q50.predict(X_val)
+        p50 = m50.predict(X_val)
+        p25 = m25.predict(X_val)
+        p75 = m75.predict(X_val)
 
-        q25_pred = q25.predict(X_val)
-        q75_pred = q75.predict(X_val)
-
-        # Debug first fold to confirm spread
         if fold == 0:
-            print(f"  Q25 range: {q25_pred.min():.0f}–{q25_pred.max():.0f}")
-            print(f"  Q75 range: {q75_pred.min():.0f}–{q75_pred.max():.0f}")
-            print(f"  IQR mean : {(q75_pred - q25_pred).mean():.1f}")
+            print(f"  Q25 range : {p25.min():.0f} – {p25.max():.0f}")
+            print(f"  Q75 range : {p75.min():.0f} – {p75.max():.0f}")
+            print(f"  IQR mean  : {(p75 - p25).mean():.1f}")
 
-        oof_sigma[val_idx] = np.clip(
-            (q75_pred - q25_pred) / 1.35,
-            a_min=70, a_max=None
-        )
+        oof_mu[val_idx]    = p50
+        oof_sigma[val_idx] = np.clip((p75 - p25) / 1.35, a_min=70, a_max=None)
 
         fold_score = laplace_metric(
             oof_mu[val_idx], oof_sigma[val_idx], y[val_idx]
         )
         print(f"Fold {fold+1:02d} | score: {fold_score:.4f} | "
-              f"mu range: {oof_mu[val_idx].min():.0f}–{oof_mu[val_idx].max():.0f} | "
+              f"mu range: {p50.min():.0f}–{p50.max():.0f} | "
               f"sigma mean: {oof_sigma[val_idx].mean():.1f}")
 
     overall = laplace_metric(oof_mu, oof_sigma, y)
     print(f"\nOverall OOF Laplace score : {overall:.4f}")
+    print("(Target to beat in Phase 2: this score + CT stream)")
 
-    return {
-        "oof_mu":    oof_mu,
-        "oof_sigma": oof_sigma,
-        "score":     overall,
-        "scaler":    scaler
-    }
+    return {"oof_mu": oof_mu, "oof_sigma": oof_sigma, "score": overall}
+
 
 if __name__ == "__main__":
     train_baseline("data/raw/train.csv")
