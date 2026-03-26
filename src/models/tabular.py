@@ -23,8 +23,7 @@ def prepare_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-FEATURES = ["Weeks", "WeekOffset", "Age", "Sex",
-            "SmokingStatus", "FVC", "FVCpct_norm"]
+FEATURES = ["Weeks", "WeekOffset", "Age", "Sex", "SmokingStatus", "FVC"]
 
 
 def train_baseline(train_csv: str, n_splits: int = 10) -> dict:
