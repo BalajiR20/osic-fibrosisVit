@@ -28,7 +28,14 @@ def train_phase2(
     df     = pd.read_csv(train_csv)
     df     = prepare_features(df)
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Device: {device} | Patients: {df['Patient'].nunique()} | Rows: {len(df)}\n")
+    # ── Filter to only patients with preprocessed volumes ──────────
+    processed_path = Path(processed_dir)
+    available_ids  = {p.stem for p in processed_path.glob("*.npy")}
+    before         = df["Patient"].nunique()
+    df             = df[df["Patient"].isin(available_ids)].reset_index(drop=True)
+    after          = df["Patient"].nunique()
+    print(f"Device: {device} | Patients: {after}/{before} have CT volumes | Rows: {len(df)}")
+    # ───────────────────────────────────────────────────────────────
 
     patients = df["Patient"].unique()
     kf       = KFold(n_splits=n_splits, shuffle=True, random_state=42)
