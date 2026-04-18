@@ -1,144 +1,312 @@
+# src/training/trainer.py
+"""
+Training logic for Phase 2 (SliceViT).
+
+Main function: train_phase2()
+    - Loads data, runs 5-fold GroupKFold CV
+    - Two-phase training: warmup (frozen ViT) then full (top-half ViT unfrozen)
+    - Saves best checkpoint per fold to checkpoints/
+    - Returns OOF predictions for metric computation
+"""
+
+import os
+import math
+import random
 import numpy as np
 import pandas as pd
-import torch
-from torch.utils.data import DataLoader
-from sklearn.model_selection import KFold
 from pathlib import Path
 
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+from sklearn.model_selection import GroupKFold
+
+from src.data.dataset import (
+    OSICDataset, prepare_features,
+    TAB_FEATURES, TRAIN_TRANSFORM, VAL_TRANSFORM
+)
 from src.models.vit2d import SliceViT
-from src.data.dataset import OSICDataset
-from src.models.tabular import prepare_features
-from src.training.loss import laplace_metric
+from src.training.loss import LaplaceLoss, laplace_metric
 
 
-def laplace_nll(mu, sigma, y):
-    delta = (y - mu).abs().clamp(max=1000.0)
-    return ((delta * 1.41421 / sigma) + torch.log(sigma * 1.41421)).mean()
+def set_seed(seed: int = 42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark     = False
+
+
+def train_one_fold(
+    train_df:      pd.DataFrame,
+    val_df:        pd.DataFrame,
+    processed_dir: str,
+    fold:          int,
+    device:        str,
+    epochs:        int   = 40,
+    lr:            float = 2e-4,
+    batch_size:    int   = 4,
+    warmup_epochs: int   = 5,
+    patience:      int   = 10,
+    checkpoint_dir:str   = "checkpoints",
+) -> tuple:
+    """
+    Train SliceViT for one CV fold.
+
+    Two-phase training:
+        Phase A — warmup_epochs: ViT fully frozen, only fusion + heads update
+        Phase B — remaining epochs: top half of ViT unfrozen, 10× lower LR
+
+    Returns:
+        best_mu    : OOF predictions for val patients at best epoch
+        best_sigma : OOF uncertainty predictions at best epoch
+        val_fvc    : ground truth FVC for val patients
+        best_score : best val Laplace score achieved
+        history    : dict with train_loss and val_score per epoch
+    """
+    os.makedirs(checkpoint_dir, exist_ok=True)
+
+    # ── Datasets & Loaders ────────────────────────────────────────────
+    train_ds = OSICDataset(
+        df=train_df, processed_dir=processed_dir,
+        tab_features=TAB_FEATURES, transform=TRAIN_TRANSFORM, is_train=True
+    )
+    val_ds = OSICDataset(
+        df=val_df, processed_dir=processed_dir,
+        tab_features=TAB_FEATURES, transform=VAL_TRANSFORM,
+        scaler=train_ds.scaler, is_train=False
+    )
+    train_loader = DataLoader(
+        train_ds, batch_size=batch_size, shuffle=True,
+        num_workers=2, pin_memory=True, drop_last=True
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=batch_size, shuffle=False,
+        num_workers=2, pin_memory=True
+    )
+
+    # ── Model ─────────────────────────────────────────────────────────
+    model = SliceViT(tab_dim=len(TAB_FEATURES)).to(device)
+    # ViT is frozen by default from __init__
+
+    # ── Optimizer (warmup: only non-ViT params) ───────────────────────
+    optimizer = torch.optim.AdamW(
+        model.get_non_vit_params(), lr=lr, weight_decay=1e-4
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=epochs, eta_min=lr * 0.01
+    )
+    loss_fn   = LaplaceLoss()
+    scaler_amp = torch.cuda.amp.GradScaler()
+
+    best_score   = -np.inf
+    best_mu      = None
+    best_sigma   = None
+    patience_cnt = 0
+    history      = {"train_loss": [], "val_score": []}
+
+    for epoch in range(1, epochs + 1):
+
+        # ── Switch from warmup to full training ───────────────────────
+        if epoch == warmup_epochs + 1:
+            vit_unfrozen = model.unfreeze_vit_top_half()
+            optimizer = torch.optim.AdamW([
+                {"params": vit_unfrozen,              "lr": lr * 0.1},
+                {"params": model.get_non_vit_params(), "lr": lr},
+            ], weight_decay=1e-4)
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=epochs - warmup_epochs, eta_min=lr * 0.01
+            )
+            print(f"    [Fold {fold}] Epoch {epoch}: ViT top half unfrozen → full training")
+
+        # ── Train ─────────────────────────────────────────────────────
+        model.train()
+        total_loss = 0.0
+        for slices, tabular, fvc in train_loader:
+            slices, tabular, fvc = (
+                slices.to(device), tabular.to(device), fvc.to(device)
+            )
+            optimizer.zero_grad()
+            with torch.cuda.amp.autocast():
+                mu, sigma = model(slices, tabular)
+                loss = loss_fn(mu, sigma, fvc)
+            scaler_amp.scale(loss).backward()
+            scaler_amp.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler_amp.step(optimizer)
+            scaler_amp.update()
+            total_loss += loss.item()
+        scheduler.step()
+        avg_loss = total_loss / len(train_loader)
+
+        # ── Validate ──────────────────────────────────────────────────
+        model.eval()
+        val_mus, val_sigmas, val_fvcs = [], [], []
+        with torch.no_grad():
+            for slices, tabular, fvc in val_loader:
+                slices, tabular = slices.to(device), tabular.to(device)
+                with torch.cuda.amp.autocast():
+                    mu, sigma = model(slices, tabular)
+                val_mus.append(mu.cpu().numpy())
+                val_sigmas.append(sigma.cpu().numpy())
+                val_fvcs.append(fvc.numpy())
+
+        val_mu    = np.concatenate(val_mus)
+        val_sigma = np.concatenate(val_sigmas)
+        val_fvc   = np.concatenate(val_fvcs)
+        val_score = laplace_metric(val_mu, val_sigma, val_fvc)
+
+        history["train_loss"].append(avg_loss)
+        history["val_score"].append(val_score)
+
+        # Log every 5 epochs
+        if epoch % 5 == 0 or epoch == 1 or epoch == warmup_epochs + 1:
+            print(
+                f"    [Fold {fold}] epoch {epoch:03d}/{epochs} | "
+                f"train_loss: {avg_loss:.4f} | "
+                f"val_score: {val_score:.4f} | "
+                f"sigma_mean: {val_sigma.mean():.1f} ml"
+            )
+
+        # Early stopping + best model checkpoint
+        if val_score > best_score:
+            best_score   = val_score
+            best_mu      = val_mu.copy()
+            best_sigma   = val_sigma.copy()
+            patience_cnt = 0
+            ckpt_path = os.path.join(checkpoint_dir, f"slicevit_fold{fold}.pt")
+            torch.save({
+                "model_state_dict":   model.state_dict(),
+                "scaler":             train_ds.scaler,
+                "fold":               fold,
+                "best_score":         best_score,
+                "tab_features":       TAB_FEATURES,
+            }, ckpt_path)
+        else:
+            patience_cnt += 1
+            if patience_cnt >= patience:
+                print(f"    [Fold {fold}] Early stop at epoch {epoch} (patience={patience})")
+                break
+
+    return best_mu, best_sigma, val_fvc, best_score, history
 
 
 def train_phase2(
-    train_csv     : str,
-    processed_dir : str,
-    n_splits      : int   = 5,
-    epochs        : int   = 30,
-    lr            : float = 2e-4,
-    num_slices    : int   = 15,
-    batch_size    : int   = 4,
-):
-    df     = pd.read_csv(train_csv)
-    df     = prepare_features(df)
+    train_csv:     str,
+    processed_dir: str,
+    n_splits:      int   = 5,
+    epochs:        int   = 40,
+    lr:            float = 2e-4,
+    batch_size:    int   = 4,
+    warmup_epochs: int   = 5,
+    patience:      int   = 10,
+    seed:          int   = 42,
+    checkpoint_dir:str   = "checkpoints",
+) -> dict:
+    """
+    Full 5-fold cross-validation training for Phase 2 SliceViT.
+
+    Args:
+        train_csv     : path to train.csv
+        processed_dir : path to folder with patient .npy CT volumes
+        n_splits      : number of CV folds
+        epochs        : max epochs per fold
+        lr            : base learning rate
+        batch_size    : CT scans per batch (keep ≤ 4 for T4 GPU)
+        warmup_epochs : epochs with ViT frozen
+        patience      : early stopping patience (epochs)
+        seed          : random seed for reproducibility
+        checkpoint_dir: where to save fold checkpoints
+
+    Returns:
+        dict with keys:
+            oof_mu, oof_sigma, oof_fvc : OOF predictions
+            fold_scores                : list of best val score per fold
+            overall_score              : OOF Laplace metric
+            fold_histories             : list of training history dicts
+    """
+    set_seed(seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    # ── Filter to only patients with preprocessed volumes ──────────
-    processed_path = Path(processed_dir)
-    available_ids  = {p.stem for p in processed_path.glob("*.npy")}
-    before         = df["Patient"].nunique()
-    df             = df[df["Patient"].isin(available_ids)].reset_index(drop=True)
-    after          = df["Patient"].nunique()
-    print(f"Device: {device} | Patients: {after}/{before} have CT volumes | Rows: {len(df)}")
-    # ───────────────────────────────────────────────────────────────
 
-    patients = df["Patient"].unique()
-    kf       = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+    # ── Load and filter to patients with CT volumes ───────────────────
+    df = pd.read_csv(train_csv)
+    df = prepare_features(df)
 
-    oof_mu    = np.zeros(len(df))
-    oof_sigma = np.zeros(len(df))
+    available_ids = {Path(f).stem for f in Path(processed_dir).glob("*.npy")}
+    n_before = df["Patient"].nunique()
+    df       = df[df["Patient"].isin(available_ids)].reset_index(drop=True)
+    n_after  = df["Patient"].nunique()
 
-    for fold, (tr_idx, val_idx) in enumerate(kf.split(patients)):
-        tr_pats  = set(patients[tr_idx])
-        val_pats = set(patients[val_idx])
+    print(f"Device   : {device}")
+    print(f"Patients : {n_after}/{n_before} have CT volumes | Rows: {len(df):,}")
+    print(f"Folds    : {n_splits} | Epochs: {epochs} | Batch: {batch_size}")
+    print(f"Warmup   : {warmup_epochs} epochs (ViT frozen)")
+    print("=" * 65)
 
-        tr_df  = df[df["Patient"].isin(tr_pats)].reset_index(drop=True)
-        val_df = df[df["Patient"].isin(val_pats)].reset_index(drop=True)
-        val_mask = df["Patient"].isin(val_pats)
+    # ── GroupKFold — no patient leaks across folds ────────────────────
+    gkf      = GroupKFold(n_splits=n_splits)
+    patients = df["Patient"].values
 
-        print(f"Fold {fold+1} | train: {len(tr_pats)} pts | val: {len(val_pats)} pts")
+    oof_mu        = np.zeros(len(df))
+    oof_sigma     = np.zeros(len(df))
+    oof_fvc       = np.zeros(len(df))
+    fold_scores   = []
+    fold_histories = []
 
-        tr_ds  = OSICDataset(tr_df,  processed_dir, num_slices, augment=True)
-        val_ds = OSICDataset(val_df, processed_dir, num_slices, augment=False)
+    for fold, (tr_idx, val_idx) in enumerate(
+        gkf.split(df, groups=patients), start=1
+    ):
+        print(f"\nFold {fold}/{n_splits} | "
+              f"train: {len(set(patients[tr_idx]))} pts | "
+              f"val: {len(set(patients[val_idx]))} pts")
 
-        tr_dl  = DataLoader(tr_ds,  batch_size=batch_size, shuffle=True,
-                            num_workers=2, pin_memory=True)
-        val_dl = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
-                            num_workers=2, pin_memory=True)
+        tr_df  = df.iloc[tr_idx].reset_index(drop=True)
+        val_df = df.iloc[val_idx].reset_index(drop=True)
 
-        model = SliceViT(num_slices=num_slices).to(device)
-        opt   = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
-        sched = torch.optim.lr_scheduler.CosineAnnealingLR(
-            opt, T_max=epochs, eta_min=1e-6
+        mu, sigma, fvc, best, history = train_one_fold(
+            train_df=tr_df,
+            val_df=val_df,
+            processed_dir=processed_dir,
+            fold=fold,
+            device=device,
+            epochs=epochs,
+            lr=lr,
+            batch_size=batch_size,
+            warmup_epochs=warmup_epochs,
+            patience=patience,
+            checkpoint_dir=checkpoint_dir,
         )
 
-        scaler = torch.cuda.amp.GradScaler()  # mixed precision
+        oof_mu[val_idx]    = mu
+        oof_sigma[val_idx] = sigma
+        oof_fvc[val_idx]   = fvc
+        fold_scores.append(best)
+        fold_histories.append(history)
 
-        best_score, best_mu, best_sigma = -999, None, None
+        print(f"  Fold {fold} BEST  : {best:.4f} | "
+              f"mu: {mu.min():.0f}–{mu.max():.0f} | "
+              f"sigma_mean: {sigma.mean():.1f} ml")
 
-        for epoch in range(epochs):
-            # ── Train ──────────────────────────────────────────────
-            model.train()
-            train_loss = 0
-            for slices, tab, fvc in tr_dl:
-                slices = slices.to(device)
-                tab    = tab.to(device)
-                fvc    = fvc.to(device)
+    # ── OOF metric ────────────────────────────────────────────────────
+    overall = laplace_metric(oof_mu, oof_sigma, oof_fvc)
+    print("\n" + "=" * 65)
+    for i, s in enumerate(fold_scores, 1):
+        print(f"  Fold {i}: {s:.4f}")
+    print("=" * 65)
+    print(f"  Overall OOF Laplace score : {overall:.4f}")
+    print(f"  Fold std                  : {np.std(fold_scores):.4f}")
+    print()
+    print(f"  Phase 1 baseline : -6.6716")
+    print(f"  Phase 2 (this)   : {overall:.4f}   Δ = {overall - (-6.6716):+.4f}")
+    print(f"  FVC-Net SOTA     : -6.6414   Gap = {overall - (-6.6414):+.4f}")
 
-                with torch.cuda.amp.autocast():
-                    mu, sigma = model(slices, tab)
-                    loss      = laplace_nll(mu, sigma, fvc)
-
-                opt.zero_grad()
-                scaler.scale(loss).backward()
-                scaler.unscale_(opt)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                scaler.step(opt)
-                scaler.update()
-                train_loss += loss.item()
-
-            sched.step()
-
-            # ── Validate ───────────────────────────────────────────
-            model.eval()
-            all_mu, all_sigma, all_y = [], [], []
-            with torch.no_grad():
-                for slices, tab, fvc in val_dl:
-                    slices = slices.to(device)
-                    tab    = tab.to(device)
-                    with torch.cuda.amp.autocast():
-                        mu, sigma = model(slices, tab)
-                    all_mu.append(mu.cpu())
-                    all_sigma.append(sigma.cpu())
-                    all_y.append(fvc)
-
-            all_mu    = torch.cat(all_mu).numpy()
-            all_sigma = torch.cat(all_sigma).numpy()
-            all_y     = torch.cat(all_y).numpy()
-            score     = laplace_metric(all_mu, all_sigma, all_y)
-
-            avg_loss  = train_loss / len(tr_dl)
-            print(f"  epoch {epoch+1:2d}/{epochs} | "
-                  f"train_loss: {avg_loss:.4f} | "
-                  f"val_score: {score:.4f} | "
-                  f"sigma: {all_sigma.mean():.1f}")
-
-            if score > best_score:
-                best_score = score
-                best_mu    = all_mu.copy()
-                best_sigma = all_sigma.copy()
-                torch.save(model.state_dict(),
-                           f"outputs/vit2d_fold{fold+1}_best.pth")
-
-        oof_mu[val_mask]    = best_mu
-        oof_sigma[val_mask] = best_sigma
-        print(f"  Fold {fold+1} best: {best_score:.4f}\n")
-
-    overall = laplace_metric(oof_mu, oof_sigma, df["FVC"].values)
-    print(f"Overall OOF score (2D ViT) : {overall:.4f}")
-    print(f"Baseline (tabular only)    : -7.39")
-    print(f"Delta                      : {overall - (-7.39):+.4f}")
-
-    return {"oof_mu": oof_mu, "oof_sigma": oof_sigma, "score": overall}
-
-
-if __name__ == "__main__":
-    train_phase2(
-        train_csv     = "data/raw/train.csv",
-        processed_dir = "data/processed/train",
-    )
+    return {
+        "oof_mu":         oof_mu,
+        "oof_sigma":      oof_sigma,
+        "oof_fvc":        oof_fvc,
+        "fold_scores":    fold_scores,
+        "overall_score":  overall,
+        "fold_histories": fold_histories,
+        "df":             df,
+    }
